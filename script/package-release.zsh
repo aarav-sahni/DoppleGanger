@@ -18,7 +18,7 @@ readonly ARCHIVE="$DIST_ROOT/$RELEASE_NAME.zip"
 readonly RELEASE_NOTES_SOURCE="${DOPPEL_RELEASE_NOTES:-$REPO_ROOT/release-notes/$DOPPEL_VERSION.md}"
 readonly RELEASE_NOTES="$DIST_ROOT/$RELEASE_NAME.md"
 readonly FEED="$DIST_ROOT/appcast.xml"
-typeset download_prefix="${DOPPEL_RELEASE_DOWNLOAD_PREFIX:-https://github.com/thomast8/doppel/releases/download/v${DOPPEL_VERSION}}"
+typeset download_prefix="${DOPPEL_RELEASE_DOWNLOAD_PREFIX:-https://github.com/aarav-sahni/DoppleGanger/releases/download/v${DOPPEL_VERSION}}"
 download_prefix="${download_prefix%/}/"
 readonly DOWNLOAD_PREFIX="$download_prefix"
 readonly SPARKLE_TOOLS="${DOPPEL_SPARKLE_TOOLS:-$REPO_ROOT/app/.build/artifacts/sparkle/Sparkle/bin}"
@@ -111,7 +111,7 @@ fi
     $appcast_signing_args \
     --download-url-prefix "$DOWNLOAD_PREFIX" \
     --embed-release-notes \
-    --link "https://github.com/thomast8/doppel" \
+    --link "https://github.com/aarav-sahni/DoppleGanger" \
     --maximum-deltas 0 \
     --maximum-versions 3 \
     -o "$FEED" \

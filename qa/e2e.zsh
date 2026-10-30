@@ -282,6 +282,27 @@ if /usr/bin/pgrep -f "${RENAMED_APP}/Contents/MacOS/ChatGPT.real" >/dev/null 2>&
 else
     fail "direct branded-app launch adopts the fallback profile" "ChatGPT.real never appeared"
 fi
+# A main process can appear briefly before integrity or renderer loading
+# aborts startup. Require both it and a renderer to survive the startup window.
+if /usr/bin/python3 - "$RENAMED_APP" <<'PYLAUNCH'
+import subprocess, sys, time
+root = sys.argv[1] + "/Contents/"
+for tick in range(16):
+    commands = subprocess.check_output(["/bin/ps", "-axo", "comm="], text=True).splitlines()
+    main = root + "MacOS/ChatGPT.real" in commands
+    renderer = any(line.startswith(root + "Frameworks/") and
+                   "/Contents/MacOS/" in line and "(Renderer)" in line for line in commands)
+    if not main:
+        sys.exit("main process exited during startup")
+    if tick == 15:
+        sys.exit(0 if renderer else "no renderer survived startup")
+    time.sleep(1)
+PYLAUNCH
+then
+    pass "main process and renderer survive startup"
+else
+    fail "main process and renderer survive startup" "the clone did not finish starting"
+fi
 [[ ! -e "$HOME/Library/Application Support/Doppel/state/clone-launch/$SLUG" ]] && \
     pass "one-shot clone authorization is consumed" || \
     fail "one-shot clone authorization is consumed" "a reusable authorization was left behind"

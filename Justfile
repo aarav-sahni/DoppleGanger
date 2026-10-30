@@ -3,6 +3,8 @@ set shell := ["zsh", "-cu"]
 test:
     ./app/test.zsh
     ./qa/release-notes.zsh
+    /usr/bin/python3 ./qa/asar-integrity.py
+    /usr/bin/python3 ./qa/oauth-routing.py
 
 qa:
     ./qa/e2e.zsh

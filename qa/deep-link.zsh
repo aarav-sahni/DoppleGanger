@@ -60,7 +60,7 @@ else
 fi
 
 OAUTH_MARKERS="$(LC_ALL=C /usr/bin/grep -a -o 'Doppel could not claim codex:// OAuth callback' "$TEST_ASAR" | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
-CALLBACKS="$(LC_ALL=C /usr/bin/grep -a -o 'callbackUrl:`codex://connector/oauth_callback`' "$TEST_ASAR" | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
+CALLBACKS="$(LC_ALL=C /usr/bin/grep -a -o '`codex://connector/oauth_callback`' "$TEST_ASAR" | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
 if [[ "$OAUTH_MARKERS" == "1" && "$CALLBACKS" == "1" ]]; then
     pass "OAuth claims the shared registered callback only when requested"
 else
@@ -97,6 +97,7 @@ spec.loader.exec_module(patcher)
 oauth = {
     "6321": b'"app-connect-oauth-callback-url":async()=>({callbackUrl:`${r.u(l.app.isPackaged)}://connector/oauth_callback`})',
     "6662": b'"app-connect-oauth-callback-url":async()=>({callbackUrl:`${r.K(l.app.isPackaged)}://connector/oauth_callback`})',
+    "21828": b'async getCallbackUrl(){return`${_.M(O.app.isPackaged)}://connector/oauth_callback`}',
 }
 queued = {
     "6321": b'if(i){let n=(e,t)=>{let n=XW(e);if(n){m(n),l?.(eG(n)?e:void 0),t?.preventDefault();return}let r=fG(e);r&&(h(r),t?.preventDefault())};e.on(`open-url`,(e,t)=>{n(t,e)});',

@@ -11,7 +11,7 @@
 set -u
 setopt PIPE_FAIL
 
-readonly ENGINE_VERSION="27"
+readonly ENGINE_VERSION="33"
 
 # When this engine copy runs from inside an installed bundle, environment
 # overrides are ignored: otherwise a same-uid process could point a
@@ -428,6 +428,10 @@ build_instance() {
         /usr/bin/ditto "$PRIMARY_APP" "$target" || \
             fail_closed "Copying the primary app into staging failed."
     fi
+    # Vendor plugin resources can be read-only and still carry quarantine
+    # attributes. xattr needs write permission to clear those attributes.
+    # Change only the private staging copy; -P avoids following bundle symlinks.
+    /bin/chmod -RP u+w "$target" || fail_closed "Making the staged app writable failed."
     /usr/bin/xattr -cr "$target" || fail_closed "Removing copied filesystem metadata failed."
     /usr/bin/codesign --verify --deep --strict "$target" >/dev/null 2>&1 || \
         fail_closed "The staged source copy did not retain the vendor signature."
@@ -481,14 +485,31 @@ build_instance() {
     # when this instance actually starts connector authorization.
     local asar_hash
     asar_hash="$(/usr/bin/python3 "$DEEP_LINK_PATCHER" patch \
-        "$target/Contents/Resources/app.asar")" || \
-        fail_closed "Patching the instance OAuth callback routing failed."
+        "$target/Contents/Resources/app.asar" 2>&1)" || \
+        fail_closed "Patching the instance OAuth callback routing failed: $asar_hash"
     (( ${#asar_hash} == 64 )) && [[ "$asar_hash" != *[^0-9a-f]* ]] || \
         fail_closed "The patched ASAR returned an invalid integrity hash."
-    /usr/libexec/PlistBuddy -c \
-        "Set :ElectronAsarIntegrity:Resources/app.asar:hash $asar_hash" \
-        "$target/Contents/Info.plist" >/dev/null || \
+    local changed_frameworks framework helper helper_entitlements
+    changed_frameworks="$(/usr/bin/python3 "$DEEP_LINK_PATCHER" sync-integrity "$target")" || \
         fail_closed "Updating Electron's ASAR integrity metadata failed."
+    for framework in "${(@f)changed_frameworks}"; do
+        [[ -n "$framework" ]] || continue
+        # Vendor-signed renderers cannot load a locally signed framework.
+        # Re-sign its helper apps first, retaining each helper's filtered
+        # entitlements and allowing it to load the clone's local libraries.
+        helper_entitlements="$entitlements_dir/helper.plist"
+        for helper in "$framework"/Helpers/*.app(N/); do
+            write_filtered_entitlements "$helper" "$helper_entitlements" && \
+                verify_filtered_entitlements "$helper_entitlements" || \
+                fail_closed "Filtering Electron helper entitlements failed."
+            /usr/bin/codesign --force --sign "$SIGN_IDENTITY" --options runtime \
+                --entitlements "$helper_entitlements" "$helper" >/dev/null || \
+                fail_closed "Signing an Electron framework helper failed."
+        done
+        /usr/bin/codesign --force --sign "$SIGN_IDENTITY" \
+            --preserve-metadata=identifier,entitlements,flags "$framework" >/dev/null || \
+            fail_closed "Signing the updated Electron integrity seal failed."
+    done
 
     # Finder provenance and resource-fork metadata are not executable content
     # and make an otherwise valid staged bundle fail code-signature sealing.

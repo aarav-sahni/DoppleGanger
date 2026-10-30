@@ -25,6 +25,7 @@ import argparse
 import hashlib
 import json
 import os
+import plistlib
 import re
 import stat
 import struct
@@ -58,18 +59,16 @@ PROTOCOL_HELPER = re.compile(
     rb"(?P<development>[A-Za-z_$][A-Za-z0-9_$]*)\}"
 )
 
-# The member holding the protocol helper is minified too, and it is renamed on
-# the vendor's own schedule: builds up to 6415 called it ``u``, 6644 onwards call
-# it ``K``. Pinning the name meant every clone build failed the moment that
-# letter changed, which is the same mistake the note above warns about. The
-# anchors that make this unambiguous are the literal message key and the
-# ``isPackaged`` argument either side of it, not the name in the middle.
+# Minified helper names vary. Build 21828 also moved callback generation from
+# an IPC handler returning {callbackUrl} to a service method returning a string.
+# Match both complete forms and preserve the caller's expected return type.
 OAUTH_CALLBACK_HANDLER = re.compile(
-    rb'"app-connect-oauth-callback-url":async\(\)=>\(\{callbackUrl:`\$\{'
+    rb'(?:(?P<legacy>"app-connect-oauth-callback-url":async\(\)=>\(\{callbackUrl:)'
+    rb'|async getCallbackUrl\(\)\{return)`\$\{'
     rb"(?P<protocol>[A-Za-z_$][A-Za-z0-9_$]*)"
     rb"\.(?P<helper>[A-Za-z_$][A-Za-z0-9_$]*)\("
     rb"(?P<electron>[A-Za-z_$][A-Za-z0-9_$]*)\.app\.isPackaged\)"
-    rb"\}://connector/oauth_callback`\}\)"
+    rb"\}://connector/oauth_callback`(?(legacy)\}\)|\})"
 )
 
 OPEN_URL_HANDLER = re.compile(
@@ -115,27 +114,23 @@ QUEUED_OPEN_URL_HANDLER = re.compile(
     rb"(?P=handler)\((?P=listener_url),(?P=listener_event)\)\}\);)"
 )
 
-# Build 6971 folded macOS URL intake into one shared handler. The codex-route
-# branch and the http(s) branch live in a single arrow function, the
-# ``open-url`` listener delegates to it, and a startup drain then replays the
-# URLs an early open-path queue captured before this handler existed. The
-# deep-link callback no longer receives a predicate ternary; it takes a source
-# URL derived from the route (the derivation call keeps its second argument
-# optional — requiring one argument shape is what broke against 6644).
-# Insertion still lands between the deep-link callback and preventDefault, so
-# a drained startup delivery takes the same restored-ownership path as a live
-# event: the drain invokes the handler without an event, and the event is
-# optional throughout. The minifier reuses one-letter names across scopes
-# (this build names both the handler and the route ``n``, and both the url
-# parameter and the app ``e``), so every backreference below stays within a
-# single scope and same-looking names still get distinct groups.
+# Match the complete shared route handler and its open-url listener, leaving
+# lifecycle wrappers and additional listeners untouched. Build 12776 moved
+# this from an if-block into startHandlingNativeUrls() with an early return
+# and added a second URL source before the startup drain. Both builds still
+# route startup and live URLs through this same local handler.
+# Requiring the old surrounding if-block or drain position broke rebuilds even
+# though the callback behavior itself was unchanged.
+# Build 20770 excludes wakeQueuedThread from the source-URL callback. Preserve
+# that guard when present; OAuth restoration still runs for its own route kind.
 DRAINED_OPEN_URL_HANDLER = re.compile(
-    rb"(?P<prefix>if\((?P<enabled>[A-Za-z_$][A-Za-z0-9_$]*)\)\{let "
+    rb"(?P<prefix>let "
     rb"(?P<handler>[A-Za-z_$][A-Za-z0-9_$]*)=\("
     rb"(?P<url>[A-Za-z_$][A-Za-z0-9_$]*),(?P<event>[A-Za-z_$][A-Za-z0-9_$]*)"
     rb"\)=>\{let (?P<route>[A-Za-z_$][A-Za-z0-9_$]*)="
     rb"(?P<parse>[A-Za-z_$][A-Za-z0-9_$]*)\((?P=url)\);if\((?P=route)\)\{"
     rb"(?P<queue>[A-Za-z_$][A-Za-z0-9_$]*)\((?P=route)\),"
+    rb"(?:(?P=route)\.kind!==`wakeQueuedThread`&&)?"
     rb"(?P<callback>[A-Za-z_$][A-Za-z0-9_$]*)\?\.\("
     rb"(?P<source>[A-Za-z_$][A-Za-z0-9_$]*)\((?P=route)(?:,(?P=url))?\)\)),"
     rb"(?P<suffix>(?P=event)\?\.preventDefault\(\);return\}let "
@@ -146,11 +141,7 @@ DRAINED_OPEN_URL_HANDLER = re.compile(
     rb"(?P<app>[A-Za-z_$][A-Za-z0-9_$]*)\.on\(`open-url`,\("
     rb"(?P<listener_event>[A-Za-z_$][A-Za-z0-9_$]*),"
     rb"(?P<listener_url>[A-Za-z_$][A-Za-z0-9_$]*)\)=>\{"
-    rb"(?P=handler)\((?P=listener_url),(?P=listener_event)\)\}\);"
-    rb"for\(let (?P<drained>[A-Za-z_$][A-Za-z0-9_$]*) of "
-    rb"(?P<queue_module>[A-Za-z_$][A-Za-z0-9_$]*)\."
-    rb"(?P<flush>[A-Za-z_$][A-Za-z0-9_$]*)\(\)\)"
-    rb"(?P=handler)\((?P=drained)\)\})"
+    rb"(?P=handler)\((?P=listener_url),(?P=listener_event)\)\}\))"
 )
 
 
@@ -291,14 +282,19 @@ def locate_protocol_member(archive: Archive) -> tuple[Member, bytes, bool]:
 def patched_oauth_handler(match: re.Match[bytes]) -> bytes:
     electron = match.group("electron")
     app = electron + b".app"
+    legacy = match.group("legacy") is not None
     return (
-        b'"app-connect-oauth-callback-url":async()=>{if(!'
+        (b'"app-connect-oauth-callback-url":async()=>{' if legacy
+         else b'async getCallbackUrl(){')
+        + b'if(!'
         + app
         + b".setAsDefaultProtocolClient(`codex`)&&!"
         + app
         + b".isDefaultProtocolClient(`codex`))throw Error(`"
         + OAUTH_PATCH_MARKER
-        + b"`);return{callbackUrl:`codex://connector/oauth_callback`}}"
+        + b"`);return"
+        + (b"{callbackUrl:`codex://connector/oauth_callback`}}" if legacy
+           else b"`codex://connector/oauth_callback`}")
     )
 
 
@@ -311,7 +307,7 @@ def locate_oauth_member(archive: Archive) -> tuple[Member, bytes, bool]:
         data = read_member(archive, member)
         if OAUTH_PATCH_MARKER in data:
             if data.count(OAUTH_PATCH_MARKER) != 1 or data.count(
-                b"callbackUrl:`codex://connector/oauth_callback`"
+                b"`codex://connector/oauth_callback`"
             ) != 1:
                 raise PatchError(
                     f"the OAuth ownership patch is malformed in {member.path}"
@@ -594,11 +590,79 @@ def verify(path: Path) -> str:
     return digest(archive.header_json)
 
 
+# Electron's macOS integrity_digest.mm seals the entire plist dictionary in
+# newer frameworks. Keep the seal enabled and update it before local signing.
+INTEGRITY_SENTINEL = b"AGbevlPCksUGKNL8TSn7wGmJEuJsXb2A"
+
+
+def dictionary_digest(integrity: dict) -> bytes:
+    payload = "".join(key + integrity[key]["algorithm"] + integrity[key]["hash"]
+                      for key in sorted(integrity))
+    return hashlib.sha256(payload.encode("utf-8")).digest()
+
+
+def refresh_integrity_slots(data: bytes, old_digest: bytes, new_digest: bytes) -> bytes:
+    result = bytearray(data)
+    cursor = 0
+    while True:
+        offset = data.find(INTEGRITY_SENTINEL, cursor)
+        if offset < 0:
+            break
+        start = offset + len(INTEGRITY_SENTINEL)
+        cursor = start + 34
+        if cursor > len(data):
+            raise PatchError("truncated framework integrity slot")
+        used, version = data[start:start + 2]
+        if used == 0:
+            continue  # Older Electron builds have no dictionary seal enabled.
+        if used != 1 or version != 1:
+            raise PatchError("unsupported framework integrity slot version")
+        if data[start + 2:cursor] != old_digest:
+            raise PatchError("framework integrity digest does not match Info.plist")
+        result[start + 2:cursor] = new_digest
+    return bytes(result)
+
+
+def sync_bundle_integrity(bundle: Path) -> list[Path]:
+    contents = bundle / "Contents"
+    info_path = contents / "Info.plist"
+    info = plistlib.loads(info_path.read_bytes())
+    integrity = info["ElectronAsarIntegrity"]
+    old_digest = dictionary_digest(integrity)
+    integrity["Resources/app.asar"]["hash"] = verify(contents / "Resources/app.asar")
+    new_digest = dictionary_digest(integrity)
+    changes = []
+    for framework in sorted((contents / "Frameworks").glob("*.framework")):
+        binary = (framework / framework.stem).resolve()
+        if not binary.is_relative_to(contents.resolve()):
+            raise PatchError("framework executable resolves outside staging bundle")
+        if not binary.is_file():
+            continue
+        data = binary.read_bytes()
+        updated = refresh_integrity_slots(data, old_digest, new_digest)
+        if updated != data:
+            changes.append((framework, binary, updated))
+    # Validate every slot before writing anything. The engine discards staging
+    # on any failure and re-signs each changed framework before sealing the app.
+    for framework, binary, updated in changes:
+        binary.write_bytes(updated)
+    info_path.write_bytes(plistlib.dumps(info))
+    return [framework for framework, _, _ in changes]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("patch", "verify"))
+    parser.add_argument("mode", choices=("patch", "verify", "sync-integrity"))
     parser.add_argument("archive", type=Path)
     arguments = parser.parse_args()
+    if arguments.mode == "sync-integrity":
+        try:
+            for framework in sync_bundle_integrity(arguments.archive):
+                print(framework)
+        except (OSError, ValueError, KeyError, TypeError, PatchError) as error:
+            print(f"patch-deep-link: {error}", file=sys.stderr)
+            return 1
+        return 0
     if not arguments.archive.is_file():
         parser.error(f"archive does not exist: {arguments.archive}")
     try:

@@ -16,6 +16,28 @@ with this project; every clone is generated on your machine from your own
 installed copy. When an update is available, Doppel downloads it only from the
 official OpenAI appcast and verifies the vendor signature before installation.
 
+## Install
+
+Doppel runs on **macOS 14 (Sonoma) or newer**. Download the latest
+`Doppel-<version>-macOS.zip` from the
+[Releases](https://github.com/aarav-sahni/DoppleGanger/releases) page, unzip it,
+and move `Doppel.app` to `~/Applications` or `/Applications`. Open the app and
+use **New Instance…** to create the first isolated profile.
+
+The distributed archive is a universal macOS build for Apple silicon and Intel.
+The first launch of an ad-hoc personal build may require choosing **Open Anyway**
+in **System Settings → Privacy & Security**. Do not install a clone copied from
+another computer; build instances locally from your own ChatGPT installation.
+
+## Requirements
+
+- macOS 14 or newer
+- The official ChatGPT macOS app installed in `/Applications/ChatGPT.app`
+- An account with permission to read and copy the installed app
+
+The app and CLI are designed for personal, local use. Doppel is not affiliated
+with or endorsed by OpenAI.
+
 <p align="center">
   <img src="docs/images/menu-permissions.png" width="820"
        alt="Doppel's menu bar menu with a managed instance's Privacy Permissions submenu open, showing granted microphone access">
@@ -378,7 +400,7 @@ Release packaging is an explicit two-step publication flow:
 ```sh
 just sparkle-key             # once; keeps the private key in your Keychain
 ${EDITOR:-open} release-notes/1.1.0.md
-just package-release 1.1.0 12
+just package-release 1.1.9 21
 ```
 
 Back up that private key once to encrypted storage; do not commit the export:
