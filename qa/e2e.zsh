@@ -179,7 +179,8 @@ check "registered OAuth callback scheme remains eligible" \
     "$(plist "$APP" CFBundleURLTypes.0.CFBundleURLSchemes.1)" "codex"
 check "deep-link patch recorded" "$(plist "$APP" DoppelDeepLinkScheme)" "codex-$SLUG"
 ROUTER_HASH="$(/usr/bin/shasum -a 256 "$CLI" | /usr/bin/awk '{print $1}')"
-check "transparent engine router version" "$(plist "$APP" DoppelEngineVersion)" "27"
+EXPECTED_ENGINE_VERSION="$(/usr/bin/sed -n 's/^readonly ENGINE_VERSION="\([0-9]*\)"/\1/p' "$REPO_ROOT/engine/doppel-engine.zsh")"
+check "transparent engine router version" "$(plist "$APP" DoppelEngineVersion)" "$EXPECTED_ENGINE_VERSION"
 check "transparent engine router hash recorded" "$(plist "$APP" DoppelRouterSHA256)" "$ROUTER_HASH"
 if [[ -x "$APP/Contents/Resources/Doppel/bin/doppel" && \
       -x "$APP/Contents/Resources/Doppel/engine/doppel-engine.zsh" && \
@@ -243,7 +244,18 @@ fi
 got="$(icon_hex "$RENAMED_APP/Contents/Resources/icon-chatgpt.png")"
 if colour_near "$got" "3B82F6"; then pass "icon recoloured blue ($got)"; else fail "icon recoloured blue" "got $got"; fi
 DR_AFTER="$(/usr/bin/codesign -d -r- "$RENAMED_APP" 2>&1 | grep 'designated =>')"
-check "code identity survives the edit (keychain and privacy grants)" "$DR_AFTER" "$DR_BEFORE"
+if [[ "$DR_BEFORE" == *"cdhash"* ]]; then
+    # Ad-hoc signatures necessarily receive a new cdhash when signed bundle
+    # resources change. A stable local signing certificate is required for
+    # keychain and privacy grants to survive an edit.
+    if [[ -n "$DR_AFTER" && "$DR_AFTER" != "$DR_BEFORE" ]]; then
+        pass "ad-hoc code identity is reported as per-build"
+    else
+        fail "ad-hoc code identity is reported as per-build" "the edited bundle lost its instance identifier"
+    fi
+else
+    check "code identity survives the edit (keychain and privacy grants)" "$DR_AFTER" "$DR_BEFORE"
+fi
 
 print -r -- ""
 print -r -- "the health check the launcher runs must find it healthy"

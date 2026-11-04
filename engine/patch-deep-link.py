@@ -1,24 +1,11 @@
 #!/usr/bin/python3
-"""Keep clone deep links separate while routing OAuth through ``codex://``.
+"""Install an Electron API adapter without rewriting vendor JavaScript.
 
-The desktop app normally derives both its OAuth callback URL and its runtime
-protocol registration from one helper. Packaged clones therefore compete for
-``codex://`` merely by launching. Google, however, validates the exact
-OpenAI-registered ``codex://connector/oauth_callback`` redirect and rejects a
-clone-specific replacement.
-
-This patch gives ordinary runtime registration a per-instance scheme, but
-keeps the registered OAuth callback unchanged. When a clone actually starts
-connector OAuth it claims ``codex://`` immediately before returning that
-callback URL. The initiating instance therefore receives the result without
-making Google validate an unregistered redirect URI.
-
-ASAR is deliberately handled here without a third-party package. The format is
-a JSON file table followed by concatenated file data. Rewriting the one changed
-member also updates subsequent offsets, per-file integrity, and prints the
-new header hash required by ElectronAsarIntegrity in Info.plist.
+Only package.json and two Doppel-owned modules change. The vendor entry point
+and every vendor JavaScript bundle retain their original bytes, independently
+of their names, minification, bundler, or OAuth implementation. ASAR integrity
+and Electron's native integrity seal stay enabled and are refreshed locally.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -26,123 +13,117 @@ import hashlib
 import json
 import os
 import plistlib
-import re
 import stat
 import struct
 import sys
 import tempfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterator
 
+BOOTSTRAP_PATH = "doppel-bootstrap.cjs"
+BOOTSTRAP_ESM_PATH = "doppel-bootstrap.mjs"
+RUNTIME_PATH = "doppel-runtime.cjs"
+ADAPTER_VERSION = 1
+RUNTIME_SOURCE = r"""'use strict';
 
-PATCH_INSERTION = b"process.env.DOPPEL_URL_SCHEME?.trim()||"
-OAUTH_PATCH_MARKER = b"Doppel could not claim codex:// OAuth callback"
-RESTORE_PATCH_MARKER = b"DOPPEL_URL_HANDLER_HELPER"
-RESTORE_SPAWN_MARKER = (
-    b'require("node:child_process").spawn(process.env.' + RESTORE_PATCH_MARKER
-)
-REQUIRED_NEIGHBOURS = (
-    b"setAsDefaultProtocolClient",
-    b"chatgpt.com",
-    b"codex-dev",
-)
+// Runs before the vendor entry point. Only documented Electron API boundaries
+// are adapted; no vendor function names, bundles, or source text are matched.
+module.exports = function installDoppelRouting({ app, shell }) {
+  const scheme = process.env.DOPPEL_URL_SCHEME?.trim();
+  if (!scheme || !/^[a-z][a-z0-9+.-]*$/i.test(scheme) || /^(codex|codex-dev)$/i.test(scheme)) {
+    throw new Error('Doppel requires a private URL scheme');
+  }
+  const originalSet = app.setAsDefaultProtocolClient.bind(app);
+  const originalCheck = app.isDefaultProtocolClient.bind(app);
+  let claimed = false;
 
-# Minified symbol names change between vendor releases. Match the behavior,
-# not today's names: the protocol helper returns production or development
-# scheme depending on app.isPackaged and platform.
-PROTOCOL_HELPER = re.compile(
-    rb"function (?P<function>[A-Za-z_$][A-Za-z0-9_$]*)"
-    rb"\(e,t=process\.platform\)\{return "
-    rb"e\|\|t===`win32`\|\|t===`linux`\?"
-    rb"(?P<production>[A-Za-z_$][A-Za-z0-9_$]*):"
-    rb"(?P<development>[A-Za-z_$][A-Za-z0-9_$]*)\}"
-)
+  function parse(value) {
+    if (typeof value !== 'string') return null;
+    try { return new URL(value); } catch { return null; }
+  }
+  function normalize(value) {
+    const url = parse(value);
+    if (url?.protocol.toLowerCase() !== scheme.toLowerCase() + ':') return value;
+    url.protocol = 'codex:';
+    return url.href;
+  }
+  function isCallback(value) {
+    const url = parse(value);
+    return url?.protocol === 'codex:' && url.hostname === 'connector' && url.pathname === '/oauth_callback';
+  }
+  function restorePrimary() {
+    claimed = false;
+    const env = process.env;
+    if (!env.DOPPEL_URL_HANDLER_HELPER || !env.DOPPEL_PRIMARY_APP || !env.DOPPEL_PRIMARY_BUNDLE_ID) return;
+    try {
+      require('node:child_process').spawn(env.DOPPEL_URL_HANDLER_HELPER,
+        ['set', 'codex', env.DOPPEL_PRIMARY_APP, env.DOPPEL_PRIMARY_BUNDLE_ID],
+        { detached: true, stdio: 'ignore' }).unref();
+    } catch { /* A helper failure must not swallow the vendor's callback. */ }
+  }
+  function claimCallback() {
+    if (!originalSet('codex') && !originalCheck('codex')) {
+      throw new Error('Doppel could not claim codex:// OAuth callback');
+    }
+    claimed = true;
+  }
+  function isOAuthLaunch(value) {
+    const url = parse(value);
+    if (!url || !['https:', 'http:'].includes(url.protocol)) return false;
+    // Redirects may be nested/percent-encoded by a connector's broker. Also
+    // recognize standard authorization endpoints when the broker keeps the
+    // native callback server-side rather than including it in the URL.
+    let decoded = value;
+    for (let depth = 0; depth < 4; depth++) {
+      if (/codex:\/\/connector\/oauth_callback(?:[?#&"\s]|$)/i.test(decoded)) return true;
+      try {
+        const next = decodeURIComponent(decoded);
+        if (next === decoded) break;
+        decoded = next;
+      } catch { break; }
+    }
+    return /(?:^|\/)(?:oauth2?|authorize|authorization)(?:\/|$)/i.test(url.pathname) ||
+      (url.searchParams.has('client_id') &&
+        (url.searchParams.has('response_type') || url.searchParams.has('code_challenge')));
+  }
 
-# Minified helper names vary. Build 21828 also moved callback generation from
-# an IPC handler returning {callbackUrl} to a service method returning a string.
-# Match both complete forms and preserve the caller's expected return type.
-OAUTH_CALLBACK_HANDLER = re.compile(
-    rb'(?:(?P<legacy>"app-connect-oauth-callback-url":async\(\)=>\(\{callbackUrl:)'
-    rb'|async getCallbackUrl\(\)\{return)`\$\{'
-    rb"(?P<protocol>[A-Za-z_$][A-Za-z0-9_$]*)"
-    rb"\.(?P<helper>[A-Za-z_$][A-Za-z0-9_$]*)\("
-    rb"(?P<electron>[A-Za-z_$][A-Za-z0-9_$]*)\.app\.isPackaged\)"
-    rb"\}://connector/oauth_callback`(?(legacy)\}\)|\})"
-)
+  for (const method of ['setAsDefaultProtocolClient', 'isDefaultProtocolClient', 'removeAsDefaultProtocolClient']) {
+    const original = app[method].bind(app);
+    app[method] = function (protocol, ...args) {
+      const routed = /^(codex|codex-dev)$/i.test(protocol) ? scheme : protocol;
+      return original(routed, ...args);
+    };
+  }
 
-OPEN_URL_HANDLER = re.compile(
-    rb"return (?P<mac>[A-Za-z_$][A-Za-z0-9_$]*)&&"
-    rb"(?P<app>[A-Za-z_$][A-Za-z0-9_$]*)\.on\(`open-url`,\("
-    rb"(?P<event>[A-Za-z_$][A-Za-z0-9_$]*),(?P<url>[A-Za-z_$][A-Za-z0-9_$]*)"
-    rb"\)=>\{let (?P<route>[A-Za-z_$][A-Za-z0-9_$]*)="
-    rb"(?P<parse>[A-Za-z_$][A-Za-z0-9_$]*)\((?P=url)\);(?P=route)&&\("
-    rb"(?P<queue>[A-Za-z_$][A-Za-z0-9_$]*)\((?P=route)\),"
-    rb"(?P<callback>[A-Za-z_$][A-Za-z0-9_$]*)\?\.\("
-    rb"(?P<predicate>[A-Za-z_$][A-Za-z0-9_$]*)\((?P=route)\)\?"
-    rb"(?P=url):void 0\),(?P=event)\.preventDefault\(\)\)\}\),"
-)
+  // Normalize before *all* vendor listeners, including listeners installed
+  // later and early startup queues. Leave event ordering and return values intact.
+  const emit = app.emit;
+  app.emit = function (event, ...args) {
+    let callback = false;
+    if (event === 'open-url') {
+      args[1] = normalize(args[1]);
+      callback = isCallback(args[1]);
+    } else if (event === 'second-instance' && Array.isArray(args[1])) {
+      args[1] = args[1].map(normalize);
+      callback = args[1].some(isCallback);
+    }
+    try { return emit.call(this, event, ...args); }
+    finally { if (callback) restorePrimary(); }
+  };
+  process.argv = process.argv.map(normalize);
+  if (process.argv.some(isCallback)) setImmediate(restorePrimary);
 
-# Build 6321 moved macOS URL intake into a shared open-path queue. The route
-# behavior is the same, but the listener now delegates to a local function so
-# initial argv URLs and later ``open-url`` events take one path. Match that
-# complete shape: patching only the short ``open-url`` wrapper would not cover
-# an OAuth callback delivered while the app is starting.
-#
-# Build 6644 started passing the original URL to the predicate alongside the
-# parsed route, so its argument list is optional here. What the predicate
-# decides is unchanged, the patch does not rebuild the call, and requiring the
-# single-argument form meant every clone build failed against 6644 and later.
-QUEUED_OPEN_URL_HANDLER = re.compile(
-    rb"(?P<prefix>if\((?P<enabled>[A-Za-z_$][A-Za-z0-9_$]*)\)\{let "
-    rb"(?P<handler>[A-Za-z_$][A-Za-z0-9_$]*)=\("
-    rb"(?P<url>[A-Za-z_$][A-Za-z0-9_$]*),(?P<event>[A-Za-z_$][A-Za-z0-9_$]*)"
-    rb"\)=>\{let (?P<route>[A-Za-z_$][A-Za-z0-9_$]*)="
-    rb"(?P<parse>[A-Za-z_$][A-Za-z0-9_$]*)\((?P=url)\);if\((?P=route)\)\{"
-    rb"(?P<queue>[A-Za-z_$][A-Za-z0-9_$]*)\((?P=route)\),"
-    rb"(?P<callback>[A-Za-z_$][A-Za-z0-9_$]*)\?\.\("
-    rb"(?P<predicate>[A-Za-z_$][A-Za-z0-9_$]*)\((?P=route)(?:,(?P=url))?\)\?"
-    rb"(?P=url):void 0\)),"
-    rb"(?P<suffix>(?P=event)\?\.preventDefault\(\);return\}let "
-    rb"(?P<path>[A-Za-z_$][A-Za-z0-9_$]*)="
-    rb"(?P<parse_path>[A-Za-z_$][A-Za-z0-9_$]*)\((?P=url)\);"
-    rb"(?P=path)&&\((?P<open_path>[A-Za-z_$][A-Za-z0-9_$]*)\((?P=path)\),"
-    rb"(?P=event)\?\.preventDefault\(\)\)\};"
-    rb"(?P<app>[A-Za-z_$][A-Za-z0-9_$]*)\.on\(`open-url`,\("
-    rb"(?P<listener_event>[A-Za-z_$][A-Za-z0-9_$]*),"
-    rb"(?P<listener_url>[A-Za-z_$][A-Za-z0-9_$]*)\)=>\{"
-    rb"(?P=handler)\((?P=listener_url),(?P=listener_event)\)\}\);)"
-)
-
-# Match the complete shared route handler and its open-url listener, leaving
-# lifecycle wrappers and additional listeners untouched. Build 12776 moved
-# this from an if-block into startHandlingNativeUrls() with an early return
-# and added a second URL source before the startup drain. Both builds still
-# route startup and live URLs through this same local handler.
-# Requiring the old surrounding if-block or drain position broke rebuilds even
-# though the callback behavior itself was unchanged.
-# Build 20770 excludes wakeQueuedThread from the source-URL callback. Preserve
-# that guard when present; OAuth restoration still runs for its own route kind.
-DRAINED_OPEN_URL_HANDLER = re.compile(
-    rb"(?P<prefix>let "
-    rb"(?P<handler>[A-Za-z_$][A-Za-z0-9_$]*)=\("
-    rb"(?P<url>[A-Za-z_$][A-Za-z0-9_$]*),(?P<event>[A-Za-z_$][A-Za-z0-9_$]*)"
-    rb"\)=>\{let (?P<route>[A-Za-z_$][A-Za-z0-9_$]*)="
-    rb"(?P<parse>[A-Za-z_$][A-Za-z0-9_$]*)\((?P=url)\);if\((?P=route)\)\{"
-    rb"(?P<queue>[A-Za-z_$][A-Za-z0-9_$]*)\((?P=route)\),"
-    rb"(?:(?P=route)\.kind!==`wakeQueuedThread`&&)?"
-    rb"(?P<callback>[A-Za-z_$][A-Za-z0-9_$]*)\?\.\("
-    rb"(?P<source>[A-Za-z_$][A-Za-z0-9_$]*)\((?P=route)(?:,(?P=url))?\)\)),"
-    rb"(?P<suffix>(?P=event)\?\.preventDefault\(\);return\}let "
-    rb"(?P<http>[A-Za-z_$][A-Za-z0-9_$]*)="
-    rb"(?P<parse_http>[A-Za-z_$][A-Za-z0-9_$]*)\((?P=url)\);"
-    rb"(?P=http)&&\((?P<queue_http>[A-Za-z_$][A-Za-z0-9_$]*)\((?P=http)\),"
-    rb"(?P=event)\?\.preventDefault\(\)\)\};"
-    rb"(?P<app>[A-Za-z_$][A-Za-z0-9_$]*)\.on\(`open-url`,\("
-    rb"(?P<listener_event>[A-Za-z_$][A-Za-z0-9_$]*),"
-    rb"(?P<listener_url>[A-Za-z_$][A-Za-z0-9_$]*)\)=>\{"
-    rb"(?P=handler)\((?P=listener_url),(?P=listener_event)\)\}\))"
-)
+  const openExternal = shell.openExternal.bind(shell);
+  shell.openExternal = async function (url, ...args) {
+    const oauth = isOAuthLaunch(url);
+    if (oauth) claimCallback();
+    try { return await openExternal(url, ...args); }
+    catch (error) { if (oauth) restorePrimary(); throw error; }
+  };
+  app.on('will-quit', () => { if (claimed) restorePrimary(); });
+};
+""".encode("utf-8")
 
 
 class PatchError(RuntimeError):
@@ -227,240 +208,6 @@ def read_member(archive: Archive, member: Member) -> bytes:
     return data
 
 
-def patched_helper(match: re.Match[bytes]) -> bytes:
-    function_name = match.group("function")
-    production = match.group("production")
-    development = match.group("development")
-    return (
-        b"function "
-        + function_name
-        + b"(e,t=process.platform){return "
-        + PATCH_INSERTION
-        + b"(e||t===`win32`||t===`linux`?"
-        + production
-        + b":"
-        + development
-        + b")}"
-    )
-
-
-def locate_protocol_member(archive: Archive) -> tuple[Member, bytes, bool]:
-    patched: list[tuple[Member, bytes]] = []
-    unpatched: list[tuple[Member, bytes, re.Match[bytes]]] = []
-    for member in members(archive):
-        if not member.path.endswith(".js") or member.size == 0:
-            continue
-        data = read_member(archive, member)
-        if not all(marker in data for marker in REQUIRED_NEIGHBOURS):
-            continue
-        if PATCH_INSERTION in data:
-            patched.append((member, data))
-            continue
-        matches = list(PROTOCOL_HELPER.finditer(data))
-        if len(matches) == 1:
-            unpatched.append((member, data, matches[0]))
-        elif matches:
-            raise PatchError(
-                f"found {len(matches)} protocol helpers in {member.path}; refusing an ambiguous patch"
-            )
-    if patched and unpatched:
-        raise PatchError("the archive contains both patched and unpatched protocol helpers")
-    if len(patched) == 1:
-        return patched[0][0], patched[0][1], True
-    if len(unpatched) == 1:
-        member, data, match = unpatched[0]
-        replacement = patched_helper(match)
-        return member, data[: match.start()] + replacement + data[match.end() :], False
-    count = len(patched) + len(unpatched)
-    if count == 0:
-        raise PatchError(
-            "the packaged app no longer contains the expected OAuth/deep-link protocol helper"
-        )
-    raise PatchError(f"found {count} candidate protocol members; refusing an ambiguous patch")
-
-
-def patched_oauth_handler(match: re.Match[bytes]) -> bytes:
-    electron = match.group("electron")
-    app = electron + b".app"
-    legacy = match.group("legacy") is not None
-    return (
-        (b'"app-connect-oauth-callback-url":async()=>{' if legacy
-         else b'async getCallbackUrl(){')
-        + b'if(!'
-        + app
-        + b".setAsDefaultProtocolClient(`codex`)&&!"
-        + app
-        + b".isDefaultProtocolClient(`codex`))throw Error(`"
-        + OAUTH_PATCH_MARKER
-        + b"`);return"
-        + (b"{callbackUrl:`codex://connector/oauth_callback`}}" if legacy
-           else b"`codex://connector/oauth_callback`}")
-    )
-
-
-def locate_oauth_member(archive: Archive) -> tuple[Member, bytes, bool]:
-    patched: list[tuple[Member, bytes]] = []
-    unpatched: list[tuple[Member, bytes, re.Match[bytes]]] = []
-    for member in members(archive):
-        if not member.path.endswith(".js") or member.size == 0:
-            continue
-        data = read_member(archive, member)
-        if OAUTH_PATCH_MARKER in data:
-            if data.count(OAUTH_PATCH_MARKER) != 1 or data.count(
-                b"`codex://connector/oauth_callback`"
-            ) != 1:
-                raise PatchError(
-                    f"the OAuth ownership patch is malformed in {member.path}"
-                )
-            patched.append((member, data))
-            continue
-        matches = list(OAUTH_CALLBACK_HANDLER.finditer(data))
-        if len(matches) == 1:
-            unpatched.append((member, data, matches[0]))
-        elif matches:
-            raise PatchError(
-                f"found {len(matches)} OAuth callback handlers in {member.path}; refusing an ambiguous patch"
-            )
-    if patched and unpatched:
-        raise PatchError("the archive contains both patched and unpatched OAuth handlers")
-    if len(patched) == 1:
-        return patched[0][0], patched[0][1], True
-    if len(unpatched) == 1:
-        member, data, match = unpatched[0]
-        replacement = patched_oauth_handler(match)
-        return member, data[: match.start()] + replacement + data[match.end() :], False
-    count = len(patched) + len(unpatched)
-    if count == 0:
-        raise PatchError("the packaged app no longer contains the expected OAuth callback handler")
-    raise PatchError(f"found {count} candidate OAuth members; refusing an ambiguous patch")
-
-
-def patched_open_url_handler(match: re.Match[bytes]) -> bytes:
-    mac = match.group("mac")
-    app = match.group("app")
-    event = match.group("event")
-    url = match.group("url")
-    route = match.group("route")
-    parse = match.group("parse")
-    queue = match.group("queue")
-    callback = match.group("callback")
-    predicate = match.group("predicate")
-    return (
-        b"return "
-        + mac
-        + b"&&"
-        + app
-        + b".on(`open-url`,("
-        + event
-        + b"," + url + b")=>{let " + route + b"=" + parse + b"(" + url + b");if("
-        + route
-        + b"){"
-        + queue
-        + b"("
-        + route
-        + b"),"
-        + callback
-        + b"?.("
-        + predicate
-        + b"("
-        + route
-        + b")?"
-        + url
-        + b":void 0);if("
-        + route
-        + b".kind===`connectorOAuthCallback`&&process.env."
-        + RESTORE_PATCH_MARKER
-        + b"&&process.env.DOPPEL_PRIMARY_APP&&process.env.DOPPEL_PRIMARY_BUNDLE_ID)try{"
-        + b'require("node:child_process").spawn(process.env.'
-        + RESTORE_PATCH_MARKER
-        + b",[`set`,`codex`,process.env.DOPPEL_PRIMARY_APP,process.env.DOPPEL_PRIMARY_BUNDLE_ID],{detached:!0,stdio:`ignore`}).unref()}catch{}"
-        + event
-        + b".preventDefault()}}),"
-    )
-
-
-def patched_queued_open_url_handler(match: re.Match[bytes]) -> bytes:
-    route = match.group("route")
-    return (
-        match.group("prefix")
-        + b";if("
-        + route
-        + b".kind===`connectorOAuthCallback`&&process.env."
-        + RESTORE_PATCH_MARKER
-        + b"&&process.env.DOPPEL_PRIMARY_APP&&process.env.DOPPEL_PRIMARY_BUNDLE_ID)try{"
-        + b'require("node:child_process").spawn(process.env.'
-        + RESTORE_PATCH_MARKER
-        + b",[`set`,`codex`,process.env.DOPPEL_PRIMARY_APP,process.env.DOPPEL_PRIMARY_BUNDLE_ID],{detached:!0,stdio:`ignore`}).unref()}catch{};"
-        + match.group("suffix")
-    )
-
-
-def patched_drained_open_url_handler(match: re.Match[bytes]) -> bytes:
-    route = match.group("route")
-    return (
-        match.group("prefix")
-        + b";if("
-        + route
-        + b".kind===`connectorOAuthCallback`&&process.env."
-        + RESTORE_PATCH_MARKER
-        + b"&&process.env.DOPPEL_PRIMARY_APP&&process.env.DOPPEL_PRIMARY_BUNDLE_ID)try{"
-        + b'require("node:child_process").spawn(process.env.'
-        + RESTORE_PATCH_MARKER
-        + b",[`set`,`codex`,process.env.DOPPEL_PRIMARY_APP,process.env.DOPPEL_PRIMARY_BUNDLE_ID],{detached:!0,stdio:`ignore`}).unref()}catch{};"
-        + match.group("suffix")
-    )
-
-
-def locate_restore_member(archive: Archive) -> tuple[Member, bytes, bool]:
-    patched: list[tuple[Member, bytes]] = []
-    unpatched: list[tuple[Member, bytes, str, re.Match[bytes]]] = []
-    for member in members(archive):
-        if not member.path.endswith(".js") or member.size == 0:
-            continue
-        data = read_member(archive, member)
-        if RESTORE_PATCH_MARKER in data:
-            if data.count(RESTORE_PATCH_MARKER) != 2 or data.count(
-                RESTORE_SPAWN_MARKER
-            ) != 1:
-                raise PatchError(
-                    f"the OAuth handler restoration patch is malformed in {member.path}"
-                )
-            patched.append((member, data))
-            continue
-        handler_matches = [
-            ("legacy", match) for match in OPEN_URL_HANDLER.finditer(data)
-        ] + [
-            ("queued", match) for match in QUEUED_OPEN_URL_HANDLER.finditer(data)
-        ] + [
-            ("drained", match) for match in DRAINED_OPEN_URL_HANDLER.finditer(data)
-        ]
-        if not handler_matches:
-            continue
-        if len(handler_matches) != 1:
-            raise PatchError(
-                f"the callback restoration target is ambiguous in {member.path}"
-            )
-        handler_kind, handler_match = handler_matches[0]
-        unpatched.append((member, data, handler_kind, handler_match))
-    if patched and unpatched:
-        raise PatchError("the archive contains both patched and unpatched callback restorers")
-    if len(patched) == 1:
-        return patched[0][0], patched[0][1], True
-    if len(unpatched) == 1:
-        member, data, handler_kind, match = unpatched[0]
-        if handler_kind == "legacy":
-            replacement = patched_open_url_handler(match)
-        elif handler_kind == "queued":
-            replacement = patched_queued_open_url_handler(match)
-        else:
-            replacement = patched_drained_open_url_handler(match)
-        return member, data[: match.start()] + replacement + data[match.end() :], False
-    count = len(patched) + len(unpatched)
-    if count == 0:
-        raise PatchError("the packaged app no longer contains the expected open-url handler")
-    raise PatchError(f"found {count} callback restoration members; refusing an ambiguous patch")
-
-
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -497,49 +244,6 @@ def copy_exact(source: Any, destination: Any, count: int) -> None:
         remaining -= len(chunk)
 
 
-def rewrite_archive(archive: Archive, member: Member, new_data: bytes) -> None:
-    all_members = list(members(archive))
-    delta = len(new_data) - member.size
-    member.entry["size"] = len(new_data)
-    refresh_member_integrity(member.entry, new_data)
-    for other in all_members:
-        if other.entry is member.entry:
-            continue
-        if other.offset > member.offset:
-            other.entry["offset"] = str(other.offset + delta)
-
-    encoded_header, header_json = encode_header(archive.header)
-    original_mode = stat.S_IMODE(archive.path.stat().st_mode)
-    temporary_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w+b", prefix=f".{archive.path.name}.", dir=archive.path.parent, delete=False
-        ) as destination, archive.path.open("rb") as source:
-            temporary_path = Path(destination.name)
-            destination.write(encoded_header)
-            source.seek(archive.data_offset)
-            copy_exact(source, destination, member.offset)
-            destination.write(new_data)
-            source.seek(archive.data_offset + member.offset + member.size)
-            copy_exact(
-                source,
-                destination,
-                archive.size - (archive.data_offset + member.offset + member.size),
-            )
-            destination.flush()
-            os.fsync(destination.fileno())
-        os.chmod(temporary_path, original_mode)
-        os.replace(temporary_path, archive.path)
-        temporary_path = None
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
-
-    # Force serialization before replacing the archive; the caller reloads it
-    # and behaviorally verifies every required patch afterwards.
-    digest(header_json)
-
-
 def verify_member_integrity(entry: dict[str, Any], data: bytes) -> None:
     integrity = entry.get("integrity")
     if not isinstance(integrity, dict) or integrity.get("algorithm") != "SHA256":
@@ -553,40 +257,126 @@ def verify_member_integrity(entry: dict[str, Any], data: bytes) -> None:
         raise PatchError("the patched member integrity hashes do not match its contents")
 
 
+def rewrite_members(archive: Archive, replacements: dict[str, bytes]) -> None:
+    """Atomically replace/add members, preserving untouched member bytes."""
+    originals = sorted(members(archive), key=lambda item: item.offset)
+    original_paths = {member.path for member in originals}
+    records = [(member.path, member.entry, member) for member in originals]
+    for name in sorted(replacements.keys() - original_paths):
+        if "/" in name or name in archive.header["files"]:
+            raise PatchError("adapter member collides with an existing archive entry")
+        entry = {}
+        archive.header["files"][name] = entry
+        records.append((name, entry, None))
+    offset = 0
+    for name, entry, member in records:
+        entry["offset"] = str(offset)
+        if name in replacements:
+            data = replacements[name]
+            entry["size"] = len(data)
+            entry.setdefault("integrity", {"algorithm": "SHA256", "blockSize": 4194304})
+            refresh_member_integrity(entry, data)
+        offset += entry["size"]
+    encoded_header, _ = encode_header(archive.header)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w+b", prefix=".doppel-asar-",
+                                          dir=archive.path.parent, delete=False) as out, archive.path.open("rb") as source:
+            temporary_path = Path(out.name)
+            out.write(encoded_header)
+            for name, _, member in records:
+                if name in replacements:
+                    out.write(replacements[name])
+                else:
+                    source.seek(archive.data_offset + member.offset)
+                    copy_exact(source, out, member.size)
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(temporary_path, stat.S_IMODE(archive.path.stat().st_mode))
+        os.replace(temporary_path, archive.path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def package_member(archive: Archive) -> tuple[Member, dict, dict[str, Member]]:
+    files = {member.path: member for member in members(archive)}
+    member = files.get("package.json")
+    if member is None:
+        raise PatchError("the packaged app has no package.json")
+    try:
+        package = json.loads(read_member(archive, member))
+    except (UnicodeError, ValueError) as error:
+        raise PatchError("the packaged app has invalid package.json") from error
+    if not isinstance(package, dict):
+        raise PatchError("the packaged app has invalid package metadata")
+    return member, package, files
+
+
+def entry_path(value: Any, files: dict[str, Member]) -> str:
+    if not isinstance(value, str) or "\\" in value or "\0" in value:
+        raise PatchError("the vendor entry point is not a safe archive path")
+    path = PurePosixPath(value)
+    if path.is_absolute() or ".." in path.parts:
+        raise PatchError("the vendor entry point escapes the archive")
+    name = str(path)
+    if name not in files or name in (BOOTSTRAP_PATH, BOOTSTRAP_ESM_PATH, RUNTIME_PATH):
+        raise PatchError("the vendor entry point is missing or collides with the adapter")
+    return name
+
+
+def bootstrap_source(main: str, esm: bool) -> bytes:
+    if esm:
+        # A genuine ESM entry with top-level await lets Electron wait for the
+        # vendor module before ready, unlike fire-and-forget import from CJS.
+        return ("import install from './" + RUNTIME_PATH + "';\n"
+                "import * as electron from 'electron';\ninstall(electron);\n"
+                "await import(" + json.dumps("./" + main) + ");\n").encode("utf-8")
+    load = "module.exports = require(" + json.dumps("./" + main) + ");"
+    return ("'use strict';\nrequire('./" + RUNTIME_PATH + "')(require('electron'));\n"
+            + load + "\n").encode("utf-8")
+
+
 def patch(path: Path) -> str:
     archive = read_archive(path)
-    member, data, already_patched = locate_protocol_member(archive)
-    if not already_patched:
-        rewrite_archive(archive, member, data)
-
-    archive = read_archive(path)
-    member, data, already_patched = locate_oauth_member(archive)
-    if not already_patched:
-        rewrite_archive(archive, member, data)
-
-    archive = read_archive(path)
-    member, data, already_patched = locate_restore_member(archive)
-    if not already_patched:
-        rewrite_archive(archive, member, data)
+    member, package, files = package_member(archive)
+    if package.get("main") in (BOOTSTRAP_PATH, BOOTSTRAP_ESM_PATH):
+        return verify(path)
+    if "doppelAdapter" in package or any(name in archive.header["files"] for name in
+                                        (BOOTSTRAP_PATH, BOOTSTRAP_ESM_PATH, RUNTIME_PATH)):
+        raise PatchError("the archive already contains an incompatible Doppel adapter")
+    main = entry_path(package.get("main", "index.js"), files)
+    esm = main.endswith(".mjs") or (package.get("type") == "module" and not main.endswith(".cjs"))
+    package["doppelAdapter"] = {"version": ADAPTER_VERSION, "originalMain": main,
+                               "esm": esm, "originalMainSHA256": digest(read_member(archive, files[main]))}
+    bootstrap = BOOTSTRAP_ESM_PATH if esm else BOOTSTRAP_PATH
+    package["main"] = bootstrap
+    rewrite_members(archive, {member.path: json.dumps(package, ensure_ascii=False, indent=2).encode("utf-8"),
+                              bootstrap: bootstrap_source(main, esm), RUNTIME_PATH: RUNTIME_SOURCE})
     return verify(path)
 
 
 def verify(path: Path) -> str:
     archive = read_archive(path)
-    member, data, already_patched = locate_protocol_member(archive)
-    if not already_patched:
-        raise PatchError("the archive still uses the shared codex:// protocol")
-    verify_member_integrity(member.entry, data)
-
-    oauth_member, oauth_data, oauth_patched = locate_oauth_member(archive)
-    if not oauth_patched:
-        raise PatchError("the OAuth callback does not claim codex:// on demand")
-    verify_member_integrity(oauth_member.entry, oauth_data)
-
-    restore_member, restore_data, restore_patched = locate_restore_member(archive)
-    if not restore_patched:
-        raise PatchError("the OAuth callback does not restore primary codex:// ownership")
-    verify_member_integrity(restore_member.entry, restore_data)
+    member, package, files = package_member(archive)
+    metadata = package.get("doppelAdapter")
+    if package.get("main") not in (BOOTSTRAP_PATH, BOOTSTRAP_ESM_PATH) or not isinstance(metadata, dict):
+        raise PatchError("the archive has no Doppel startup adapter")
+    if metadata.get("version") != ADAPTER_VERSION or not isinstance(metadata.get("esm"), bool):
+        raise PatchError("the archive has an unsupported Doppel adapter version")
+    main = entry_path(metadata.get("originalMain"), files)
+    if digest(read_member(archive, files[main])) != metadata.get("originalMainSHA256"):
+        raise PatchError("the vendor entry point changed after adapter installation")
+    bootstrap = BOOTSTRAP_ESM_PATH if metadata["esm"] else BOOTSTRAP_PATH
+    if package["main"] != bootstrap:
+        raise PatchError("the Doppel entry point has the wrong module format")
+    expected = {bootstrap: bootstrap_source(main, metadata["esm"]), RUNTIME_PATH: RUNTIME_SOURCE}
+    for name, contents in expected.items():
+        if name not in files or read_member(archive, files[name]) != contents:
+            raise PatchError("the Doppel adapter is missing or modified: " + name)
+        verify_member_integrity(files[name].entry, contents)
+    verify_member_integrity(member.entry, read_member(archive, member))
     return digest(archive.header_json)
 
 

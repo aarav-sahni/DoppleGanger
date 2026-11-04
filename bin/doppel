@@ -3199,7 +3199,7 @@ cmd_native_tools() {
 cmd_prune() {
     # Declared once: `local x` on a name that is already local in the same
     # scope makes zsh print it, which turned a loop into pages of debug output.
-    local keep="${DOPPEL_KEEP_BACKUPS:-1}"
+    local keep="${DOPPEL_KEEP_BACKUPS:-0}"
     local state_root="$DOPPEL_HOME/state" before after instance_state staged index only=""
     local -a targets rollbacks
 

@@ -85,10 +85,17 @@ build_stub_binary() {
 install_stub_binary() {
     local binary="$1"
     /bin/mkdir -p "${binary:h}"
-    /bin/cp "$STUB_BINARY" "$binary"
+    # Each fixture uses this same stand-in throughout. Reuse it rather than
+    # rewriting a signed executable the kernel may still have cached.
+    [[ -x "$binary" ]] && return 0
+    # macOS may keep an executed vnode sealed after the process exits. Replace
+    # the file atomically instead of copying over that previously run inode.
+    local staged="$binary.staged"
+    /bin/cp "$STUB_BINARY" "$staged"
     # Copying moves the binary out from under its signature's page hashes on
     # arm64 unless it is re-sealed, and an unsealed binary will not execute.
-    /usr/bin/codesign --force --sign - "$binary" >/dev/null 2>&1
+    /usr/bin/codesign --force --sign - "$staged" >/dev/null 2>&1
+    /bin/mv "$staged" "$binary"
 }
 
 await_stub() {

@@ -813,8 +813,8 @@ BACKUPS="$DOPPEL_DIR/state/com.openai.codex.doppel-$SLUG/Backups"
 /bin/mkdir -p "$BACKUPS/older.app.rollback" "$BACKUPS/oldest.app.rollback"
 # Named, so the check never reaches past its own throwaway instance.
 "$CLI" prune "$NAME" >/dev/null 2>&1
-check "prune keeps one rollback" \
-    "$(/bin/ls -d "$BACKUPS"/*.rollback(N/) 2>/dev/null | /usr/bin/wc -l | /usr/bin/tr -d ' ')" "1"
+check "prune removes obsolete rollback copies" \
+    "$(/usr/bin/find "$BACKUPS" -maxdepth 1 -type d -name '*.rollback' | /usr/bin/wc -l | /usr/bin/tr -d ' ')" "0"
 
 print -r -- ""
 print -r -- "stored rollback apps do not appear as duplicate installed apps"

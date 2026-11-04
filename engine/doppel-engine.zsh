@@ -11,7 +11,7 @@
 set -u
 setopt PIPE_FAIL
 
-readonly ENGINE_VERSION="33"
+readonly ENGINE_VERSION="34"
 
 # When this engine copy runs from inside an installed bundle, environment
 # overrides are ignored: otherwise a same-uid process could point a
@@ -78,6 +78,7 @@ readonly DEEP_LINK_PATCHER="$ASSET_ROOT/patch-deep-link.py"
 readonly ICON_ICNS="$ASSET_ROOT/assets/icon.icns"
 readonly ICON_PNG="$ASSET_ROOT/assets/icon.png"
 readonly LOG_FILE="$STATE_ROOT/engine.log"
+typeset -g ACTIVE_STAGING=""
 readonly LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 readonly ROLLBACK_INFO_NAME="Info.plist.doppel-rollback"
 
@@ -113,6 +114,12 @@ log_message() {
 fail_closed() {
     local message="$1"
     log_message "ERROR: $message"
+    # Only this process's private, incomplete build is disposable. Never leave
+    # an unsigned .app in Staging where Launch Services can discover it.
+    if [[ -n "$ACTIVE_STAGING" && "$ACTIVE_STAGING" == "$STATE_ROOT/Staging/"* ]]; then
+        /bin/rm -rf "$ACTIVE_STAGING" 2>/dev/null || true
+        ACTIVE_STAGING=""
+    fi
     if [[ "${DOPPEL_NO_ALERT:-0}" != "1" && -x "$ALERT_HELPER" ]]; then
         "$ALERT_HELPER" "$DOPPEL_DISPLAY_NAME" "$message" >/dev/null 2>&1 &
     fi
@@ -179,7 +186,7 @@ unmask_rollback_app() {
 # rebuilt, and a vendor update rebuilds on its own, so without this they piled
 # up unbounded — tens of gigabytes on a machine with a couple of instances.
 prune_state() {
-    local keep="${DOPPEL_KEEP_BACKUPS:-1}" index
+    local keep="${DOPPEL_KEEP_BACKUPS:-0}" index
     local -a rollbacks
     rollbacks=("$STATE_ROOT/Backups"/*.rollback(N/om))
     for (( index = keep + 1; index <= ${#rollbacks}; index++ )); do
@@ -330,7 +337,7 @@ patch_plist() {
     # Electron can only claim a macOS protocol that the bundle declares. Keep
     # the instance scheme first for ordinary launch-time registration, and
     # declare the vendor callback scheme second so connector OAuth can claim it
-    # just in time. The ASAR patch still prevents a normal clone launch from
+    # just in time. The startup adapter prevents a normal clone launch from
     # taking codex:// ownership.
     /usr/bin/plutil -replace CFBundleURLTypes.0.CFBundleURLSchemes -json \
         "[\"$DOPPEL_URL_SCHEME\",\"$PRIMARY_SCHEME\"]" "$info"
@@ -342,9 +349,8 @@ patch_plist() {
     # updater and is the supported interception point. Only the untouched,
     # vendor-signed primary app is ever allowed to run Sparkle.
     /usr/bin/plutil -replace LSEnvironment.CODEX_SPARKLE_ENABLED -string "false" "$info"
-    # The packaged app otherwise hardcodes codex:// both when it creates an
-    # OAuth callback and when it registers with Launch Services. The cloned
-    # app.asar reads this per-instance value instead.
+    # The startup adapter routes Electron's ordinary registration to this
+    # instance without changing the vendor's registered OAuth callback URL.
     /usr/bin/plutil -replace LSEnvironment.DOPPEL_URL_SCHEME -string "$DOPPEL_URL_SCHEME" "$info"
     # Sparkle must not update an instance: it would replace the bundle with the
     # vendor's, dropping the launcher and this instance's LSEnvironment profile
@@ -480,13 +486,12 @@ build_instance() {
     patch_plist "$target/Contents/Info.plist" "$version" "$executable_hash" || \
         fail_closed "Patching the instance metadata failed."
 
-    # Keep launch-time registration instance-specific, but retain Google's
-    # registered codex:// OAuth callback. The ASAR patch claims codex:// only
-    # when this instance actually starts connector authorization.
+    # Install the API adapter through package.json, keeping every vendor JS
+    # bundle byte-identical. Bundler/minifier changes no longer affect routing.
     local asar_hash
     asar_hash="$(/usr/bin/python3 "$DEEP_LINK_PATCHER" patch \
         "$target/Contents/Resources/app.asar" 2>&1)" || \
-        fail_closed "Patching the instance OAuth callback routing failed: $asar_hash"
+        fail_closed "Installing the instance URL routing adapter failed: $asar_hash"
     (( ${#asar_hash} == 64 )) && [[ "$asar_hash" != *[^0-9a-f]* ]] || \
         fail_closed "The patched ASAR returned an invalid integrity hash."
     local changed_frameworks framework helper helper_entitlements
@@ -926,6 +931,7 @@ launch_instance() {
     lock="$(acquire_rebuild_lock)" || exit 1
     timestamp="$(/bin/date '+%Y%m%d-%H%M%S')"
     staging="$STATE_ROOT/Staging/$DOPPEL_DISPLAY_NAME.$version.$timestamp.$$.app"
+    ACTIVE_STAGING="$staging"
     build_instance "$staging" "$version" "$executable_hash"
 
     backup_root="$STATE_ROOT/Backups"
@@ -948,6 +954,7 @@ launch_instance() {
         fi
         fail_closed "Installing the rebuilt instance failed."
     fi
+    ACTIVE_STAGING=""
 
     "$LSREGISTER" -f "$app" >/dev/null 2>&1 || true
     # A pre-fix clone may have left an explicit preference claiming the
@@ -962,7 +969,7 @@ launch_instance() {
     record_pinned_requirement "$app"
     prune_state
     release_rebuild_lock "$lock"
-    log_message "Installed instance $version; rollback preserved at $backup"
+    log_message "Installed instance $version; retained ${DOPPEL_KEEP_BACKUPS:-0} rollback(s)"
     if [[ "${DOPPEL_INSTALL_ONLY:-0}" == "1" ]]; then
         return 0
     fi

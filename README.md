@@ -189,10 +189,10 @@ must not take them with it. The refusal happens before anything is moved, so a
 refused purge leaves the instance intact; remove it without the flag and delete
 what you actually want gone yourself.
 
-Every rebuild keeps the previous bundle as a rollback, and a vendor update
-rebuilds on its own, so `prune` exists to drop the ones you no longer need. It
-keeps the most recent rollback per instance (`DOPPEL_KEEP_BACKUPS` to change
-that) and clears any staging left by a build that died. Rebuilds prune as they
+Each rebuild preserves the previous bundle until the replacement is verified
+and installed. `prune` drops copies left by earlier versions. It
+removes rollback copies by default (`DOPPEL_KEEP_BACKUPS=1` to retain one)
+and clears any staging left by a build that died. Rebuilds prune as they
 go, so this is only needed to reclaim what earlier versions left behind.
 
 Stored rollbacks are deliberately kept out of normal macOS app discovery. For
@@ -498,9 +498,15 @@ genuinely weaker than the app it was copied from is in
   Each clone declares that callback scheme without claiming it during normal
   launch. The instance starting connector authorization claims `codex://` only
   for that authorization, so the result returns there instead of to the clone
-  launched most recently. Doppel refuses a rebuild if a vendor release changes
-  either interception point and repairs stale shared-handler ownership from old
-  builds.
+  launched most recently. A startup adapter wraps Electron's documented protocol,
+  URL event, and external-browser APIs; vendor JavaScript bundles are never
+  rewritten or matched by minified source patterns. The adapter claims the
+  callback before opening an OAuth authorization URL and restores the primary
+  handler after callback delivery, browser failure, or exit. Unrelated links
+  retain their usual behavior. Changes to Electron APIs or the vendor's use of
+  those APIs can still require maintenance, but changing bundlers or minifiers
+  no longer invalidates the patch. Rebuilds retain a transaction backup until
+  installation succeeds, then remove it by default to keep one installed clone.
 - **The in-app browser cannot work inside a locally re-signed clone, and this
   one is permanent.**
   ChatGPT gates its browser socket with a native peer check that requires the

@@ -1,167 +1,208 @@
 #!/usr/bin/python3
-"""Exercise callback restoration through startup and live URL delivery."""
+"""Check the stable bootstrap and Electron routing adapter, without real OAuth."""
 import importlib.util
+import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 
-spec = importlib.util.spec_from_file_location(
-    'patcher', Path(__file__).resolve().parents[1] / 'engine/patch-deep-link.py')
+spec = importlib.util.spec_from_file_location('patcher', Path(__file__).resolve().parents[1] / 'engine/patch-deep-link.py')
 patcher = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = patcher
 spec.loader.exec_module(patcher)
 
-# Build 12776: registration moved into a function with an early-return guard;
-# a browser-handoff listener now separates open-url registration from the drain.
-PREVIOUS = b'function T(){if(!t)return;let n=(e,t)=>{let n=n9(e);if(n){g(n),u?.(a9(n,e)),t?.preventDefault();return}let r=f9(e);r&&(_(r),t?.preventDefault())};e.on(`open-url`,(e,t)=>{n(t,e)}),d.l(e,(e,t)=>(g(t),u?.(void 0),!0));for(let e of d.s())n(e)}'
-# Build 20770 adds a callback guard for background thread wakeups.
-CURRENT = PREVIOUS.replace(b'g(n),u?.', b'g(n),n.kind!==`wakeQueuedThread`&&u?.')
+
+class ArchiveTests(unittest.TestCase):
+    def setUp(self):
+        self.scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(self.scratch.cleanup)
+        self.path = Path(self.scratch.name) / 'app.asar'
+
+    def make_archive(self, main='entry.js', kind=None, source=b'module.exports = 42;', extra=None):
+        package = {'name': 'vendor-fixture', 'main': main}
+        if kind:
+            package['type'] = kind
+        data = {'package.json': json.dumps(package).encode(), main: source,
+                'arbitrary-vendor-chunk.js': b'class CompletelyDifferentBundler {}',
+                'empty.js': b'', **(extra or {})}
+        header = {'files': {}}
+        payload = b''
+        for name, content in data.items():
+            entry = {'offset': str(len(payload)), 'size': len(content),
+                     'integrity': {'algorithm': 'SHA256', 'blockSize': 4096}}
+            patcher.refresh_member_integrity(entry, content)
+            header['files'][name] = entry
+            payload += content
+        encoded, _ = patcher.encode_header(header)
+        self.path.write_bytes(encoded + payload)
+        return data
+
+    def test_arbitrary_vendor_sources_unchanged_and_patch_idempotent(self):
+        for source in (b'function oldMinifier(){return "codex"}',
+                       b'(()=>{class RspackModule{#field=123}})();',
+                       b'/* No protocol or OAuth code whatsoever */'):
+            with self.subTest(source=source):
+                before = self.make_archive(source=source)
+                header_hash = patcher.patch(self.path)
+                archive = patcher.read_archive(self.path)
+                after = {member.path: patcher.read_member(archive, member) for member in patcher.members(archive)}
+                for name, contents in before.items():
+                    if name != 'package.json':
+                        self.assertEqual(after[name], contents)
+                self.assertEqual(len(after), len(before) + 2)
+                unchanged = self.path.read_bytes()
+                self.assertEqual(patcher.patch(self.path), header_hash)
+                self.assertEqual(self.path.read_bytes(), unchanged)
+                self.assertEqual(patcher.verify(self.path), header_hash)
+
+    def test_cjs_and_esm_entry_points(self):
+        for main, kind, esm in [('entry.js', None, False), ('entry.js', 'module', True),
+                                ('entry.mjs', None, True), ('entry.cjs', 'module', False)]:
+            with self.subTest(main=main, kind=kind):
+                self.make_archive(main=main, kind=kind)
+                patcher.patch(self.path)
+                archive = patcher.read_archive(self.path)
+                _, package, files = patcher.package_member(archive)
+                self.assertEqual(package['doppelAdapter']['esm'], esm)
+                self.assertEqual(patcher.read_member(archive, files[package['main']]),
+                                 patcher.bootstrap_source(main, esm))
+
+    def test_rejects_unsafe_missing_and_conflicting_entries_without_writing(self):
+        for main in ('../entry.js', '/entry.js', 'bad\\entry.js'):
+            with self.subTest(main=main):
+                self.make_archive(main=main)
+                before = self.path.read_bytes()
+                with self.assertRaises(patcher.PatchError):
+                    patcher.patch(self.path)
+                self.assertEqual(self.path.read_bytes(), before)
+        self.make_archive(extra={patcher.RUNTIME_PATH: b'collision'})
+        before = self.path.read_bytes()
+        with self.assertRaises(patcher.PatchError):
+            patcher.patch(self.path)
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_modified_adapter_and_vendor_entry_rejected(self):
+        for target in ('entry.js', patcher.BOOTSTRAP_PATH, patcher.RUNTIME_PATH):
+            with self.subTest(target=target):
+                self.make_archive()
+                patcher.patch(self.path)
+                archive = patcher.read_archive(self.path)
+                patcher.rewrite_members(archive, {target: b'changed'})
+                with self.assertRaises(patcher.PatchError):
+                    patcher.verify(self.path)
+
+    def test_unmodified_vendor_is_not_accepted_as_adapted(self):
+        self.make_archive()
+        with self.assertRaises(patcher.PatchError):
+            patcher.verify(self.path)
 
 
-def run_javascript(javascript):
-    swift = '''import Foundation
-import JavaScriptCore
-let context = JSContext()!
-var failed = false
-context.exceptionHandler = { _, error in
-    failed = true
-    print(error?.toString() ?? "JavaScript exception")
-}
-let script = String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8)!
-var result = context.evaluateScript(script)
-if let asyncResult = context.objectForKeyedSubscript("doppelTestResult"), !asyncResult.isUndefined {
-    result = asyncResult
-}
-if failed || result?.toString() != "PASS" {
-    print(result?.toString() ?? "No JavaScript result")
-    exit(1)
-}
-'''
-    return subprocess.run(['/usr/bin/swift', '-e', swift], input=javascript,
-                          text=True, capture_output=True, timeout=90)
-
-
-class RoutingTests(unittest.TestCase):
-    def test_current_handler_behavior(self):
-        self.exercise_handler(CURRENT, wake_callback=False)
-
-    def test_previous_handler_behavior(self):
-        self.exercise_handler(PREVIOUS, wake_callback=True)
-
-    def exercise_handler(self, sample, wake_callback):
-        matches = list(patcher.DRAINED_OPEN_URL_HANDLER.finditer(sample))
-        self.assertEqual(len(matches), 1)
-        match = matches[0]
-        patched = (sample[:match.start()] + patcher.patched_drained_open_url_handler(match)
-                   + sample[match.end():]).decode()
-        # Execute the actual replacement in macOS's JavaScriptCore. No Node
-        # install, OAuth request, or real protocol ownership change is needed.
-        javascript = r'''
-const results = [];
-function check(value, message) { if (!value) throw Error(message); }
-function exercise(enabled) {
-  let t=enabled, listener=null, handoff=null, spawned=[], queued=[], callbacks=[], http=[];
-  let e={on:(name,fn)=>{check(name==='open-url','event name');listener=fn;}};
-  let d={l:(app,fn)=>{check(app===e,'handoff app');handoff=fn;},s:()=>['oauth']};
-  let g=route=>queued.push(route.kind), u=url=>callbacks.push(url);
-  let n9=url=>url==='oauth'?{kind:'connectorOAuthCallback'}:url==='thread'?{kind:'thread'}:url==='wake'?{kind:'wakeQueuedThread'}:null;
-  let a9=(route,url)=>url, f9=url=>url==='https://example.test'?url:null, _=url=>http.push(url);
-  let process={env:{DOPPEL_URL_HANDLER_HELPER:'/helper',DOPPEL_PRIMARY_APP:'/primary',DOPPEL_PRIMARY_BUNDLE_ID:'primary'}};
-  let require=name=>{check(name==='node:child_process','module');return {spawn:(path,args,opts)=>{
-    check(path==='/helper' && args.join('|')==='set|codex|/primary|primary','restore destination');
-    check(opts.detached && opts.stdio==='ignore','spawn options');spawned.push(args);return {unref:()=>{}};
-  }}};
-''' + patched + r'''
-  T();
-  if (!enabled) {check(listener===null && spawned.length===0,'disabled registration');return;}
-  check(spawned.length===1 && callbacks[0]==='oauth','startup OAuth restoration');
-  check(typeof handoff==='function','browser-handoff registration preserved');
-  let prevented=0, event={preventDefault:()=>prevented++};
-  listener(event,'oauth');
-  check(spawned.length===2 && prevented===1,'live OAuth restoration');
-  listener(event,'thread');listener(event,'https://example.test');listener(event,'unknown');
-  check(spawned.length===2 && prevented===3 && http.length===1,'ordinary URLs unchanged');
-  delete process.env.DOPPEL_URL_HANDLER_HELPER;
-  listener(event,'oauth');check(spawned.length===2 && prevented===4,'missing helper safely ignored');
-  process.env.DOPPEL_URL_HANDLER_HELPER='/helper';require=()=>{throw Error('spawn failed');};
-  listener(event,'oauth');check(prevented===5,'spawn failure preserves callback handling');
-  let count=callbacks.length;
-  listener(event,'wake');
-  check(queued[queued.length-1]==='wakeQueuedThread' && spawned.length===2 && prevented===6,'wake route still queued');
-  check(callbacks.length===count+WAKE_CALLBACK_COUNT,'wake callback guard preserved');
-}
-exercise(false);exercise(true);'PASS';
-'''
-        javascript = javascript.replace('WAKE_CALLBACK_COUNT', str(int(wake_callback)))
-        result = run_javascript(javascript)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
-    def test_different_listener_target_rejected(self):
-        changed = CURRENT.replace(b'n(t,e)}),', b'other(t,e)}),')
-        self.assertIsNone(patcher.DRAINED_OPEN_URL_HANDLER.search(changed))
-
-    def test_guard_on_different_route_rejected(self):
-        changed = CURRENT.replace(b'n.kind!==', b'other.kind!==')
-        self.assertIsNone(patcher.DRAINED_OPEN_URL_HANDLER.search(changed))
-
-
-class OAuthClaimTests(unittest.TestCase):
-    samples = (
-        b'"app-connect-oauth-callback-url":async()=>({callbackUrl:`${r.u(l.app.isPackaged)}://connector/oauth_callback`})',
-        b'"app-connect-oauth-callback-url":async()=>({callbackUrl:`${r.K(l.app.isPackaged)}://connector/oauth_callback`})',
-        b'async getCallbackUrl(){return`${_.M(O.app.isPackaged)}://connector/oauth_callback`}',
-        b'async getCallbackUrl(){return`${$a.$b($c.app.isPackaged)}://connector/oauth_callback`}',
-    )
-
-    def test_claims_protocol_and_preserves_return_type(self):
-        for sample in self.samples:
-            with self.subTest(sample=sample):
-                match = patcher.OAUTH_CALLBACK_HANDLER.fullmatch(sample)
-                self.assertIsNotNone(match)
-                legacy = match.group('legacy') is not None
-                patched = patcher.patched_oauth_handler(match).decode()
-                handler = ('({' + patched + '})["app-connect-oauth-callback-url"]' if legacy
-                           else 'new (class {' + patched + '})().getCallbackUrl')
-                javascript = r'''
-var doppelTestResult = 'pending';
-(async()=>{
-  function check(value,message){if(!value)throw Error(message);}
-  let claims=[],checks=[],claim=true,owned=false;
-  const app={
-    setAsDefaultProtocolClient:scheme=>{claims.push(scheme);return claim;},
-    isDefaultProtocolClient:scheme=>{checks.push(scheme);return owned;}
-  };
-  const l={app},O={app},$c={app};
-  const handler=HANDLER;
-  function checkResult(result){
-    check(LEGACY ? typeof result==='object' : typeof result==='string','return type');
-    check((LEGACY ? result.callbackUrl : result)==='codex://connector/oauth_callback','registered callback URL');
+class RuntimeTests(unittest.TestCase):
+    def test_electron_contract(self):
+        node = shutil.which('node')
+        bundled = Path('/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node')
+        if not node and bundled.is_file():
+            node = str(bundled)
+        self.assertIsNotNone(node, 'Node is required (the vendor app includes it)')
+        script = r'''
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const {EventEmitter} = require('node:events');
+const source = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
+function boot(options={}) {
+  const calls=[],timers=[];
+  const app=new EventEmitter();
+  for(const method of ['setAsDefaultProtocolClient','isDefaultProtocolClient','removeAsDefaultProtocolClient']) {
+    app[method]=function(...args) {
+      assert.equal(this,app);calls.push([method,...args]);
+      return method==='isDefaultProtocolClient' ? !!options.owned : options.claim!==false;
+    };
   }
-  checkResult(await handler());
-  check(claims.join()==='codex' && checks.length===0,'claim before returning callback');
-  claim=false;owned=true;
-  checkResult(await handler());
-  check(claims.length===2 && checks.join()==='codex','existing ownership accepted');
-  owned=false;
-  let error=null;
-  try{await handler();}catch(e){error=e;}
-  check(error?.message==='Doppel could not claim codex:// OAuth callback','failed ownership rejects OAuth');
-  check(claims.length===3 && checks.length===2,'ownership checked on every request');
-  doppelTestResult='PASS';
-})().catch(error=>{doppelTestResult=String(error.stack||error);});
-'''
-                javascript = javascript.replace('HANDLER', handler).replace('LEGACY', str(legacy).lower())
-                result = run_javascript(javascript)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+  const env={DOPPEL_URL_SCHEME:'codex-personal',DOPPEL_URL_HANDLER_HELPER:'/helper',
+             DOPPEL_PRIMARY_APP:'/Applications/ChatGPT.app',DOPPEL_PRIMARY_BUNDLE_ID:'com.openai.codex',...options.env};
+  const proc={env,argv:options.argv||['app','ordinary']};
+  const shell={openExternal:async function(...args){assert.equal(this,shell);calls.push(['open',...args]);
+    if(options.openFails)throw Error('browser failed');return 'opened';}};
+  const context={module:{exports:{}},process:proc,URL,setImmediate:fn=>timers.push(fn),require:name=>{
+    assert.equal(name,'node:child_process');return {spawn:(path,args,opts)=>{
+      calls.push(['restore',path,args,opts]);if(options.spawnFails)throw Error('helper failed');
+      return {unref:()=>calls.push(['unref'])};}};}};
+  vm.runInNewContext(source,context);
+  context.module.exports({app,shell});
+  return {app,shell,proc,calls,timers};
+}
+(async()=>{
+  const regular=boot();
+  assert.equal(regular.calls.length,0,'normal startup never claims the shared callback');
+  assert.equal(regular.app.setAsDefaultProtocolClient('codex','exe',['arg']),true);
+  assert.equal(regular.calls[0][1],'codex-personal');
+  assert.deepEqual(regular.calls[0].slice(2),['exe',['arg']]);
+  regular.app.isDefaultProtocolClient('CODEX');regular.app.removeAsDefaultProtocolClient('codex-dev');
+  assert.equal(regular.calls[1][1],'codex-personal');assert.equal(regular.calls[2][1],'codex-personal');
+  regular.app.setAsDefaultProtocolClient('another-scheme');assert.equal(regular.calls[3][1],'another-scheme');
+  const opts={activate:false};
+  assert.equal(await regular.shell.openExternal('https://example.test/docs/oauth-guide',opts),'opened');
+  assert.deepEqual(regular.calls.at(-1),['open','https://example.test/docs/oauth-guide',opts]);
+  regular.app.emit('will-quit');assert(!regular.calls.some(c=>c[0]==='restore'));
 
-    def test_other_methods_and_callback_paths_rejected(self):
-        sample = self.samples[2]
-        for changed in (sample.replace(b'getCallbackUrl', b'otherMethod'),
-                        sample.replace(b'connector/oauth_callback', b'other/callback'),
-                        sample.replace(b'app.isPackaged', b'app.otherProperty')):
-            with self.subTest(sample=changed):
-                self.assertIsNone(patcher.OAUTH_CALLBACK_HANDLER.search(changed))
+  for(const url of ['https://example.test/start?redirect_uri='+encodeURIComponent('codex://connector/oauth_callback'),
+                    'https://example.test/start?target='+encodeURIComponent(encodeURIComponent('codex://connector/oauth_callback')),
+                    'https://accounts.example.test/o/oauth2/v2/auth',
+                    'https://example.test/authorize',
+                    'https://example.test/login?client_id=test&response_type=code']) {
+    const oauth=boot();
+    await oauth.shell.openExternal(url,opts);
+    assert.equal(oauth.calls[0][0],'setAsDefaultProtocolClient');assert.equal(oauth.calls[0][1],'codex');
+    assert.deepEqual(oauth.calls[1],['open',url,opts]);
+    let delivered;const event={preventDefault:()=>{throw Error('adapter consumed the event');}};
+    oauth.app.on('open-url',(e,value)=>{assert.equal(e,event);delivered=value;assert(!oauth.calls.some(c=>c[0]==='restore'));});
+    assert.equal(oauth.app.emit('open-url',event,'codex://connector/oauth_callback?code=test'),true);
+    assert.equal(delivered,'codex://connector/oauth_callback?code=test');
+    const restore=oauth.calls.find(c=>c[0]==='restore');
+    assert.equal(restore[1],'/helper');assert.equal(restore[2].join('|'),'set|codex|/Applications/ChatGPT.app|com.openai.codex');
+    assert(restore[3].detached&&restore[3].stdio==='ignore');
+  }
+  const blocked=boot({claim:false});
+  await assert.rejects(()=>blocked.shell.openExternal('https://example.test/oauth'),/could not claim/);
+  assert(!blocked.calls.some(c=>c[0]==='open'));
+  const alreadyOwned=boot({claim:false,owned:true});
+  await alreadyOwned.shell.openExternal('https://example.test/oauth');assert.equal(alreadyOwned.calls[1][0],'isDefaultProtocolClient');
+  const failedBrowser=boot({openFails:true});
+  await assert.rejects(()=>failedBrowser.shell.openExternal('https://example.test/oauth'),/browser failed/);
+  assert(failedBrowser.calls.some(c=>c[0]==='restore'));
+  const quit=boot();await quit.shell.openExternal('https://example.test/oauth');quit.app.emit('will-quit');
+  assert(quit.calls.some(c=>c[0]==='restore'));
+
+  const intake=boot({argv:['app','codex-personal://thread/abc?foo=bar','not a URL']});
+  assert.equal(intake.proc.argv[1],'codex://thread/abc?foo=bar');assert.equal(intake.proc.argv[2],'not a URL');
+  let live;intake.app.on('open-url',(_,url)=>{live=url;});
+  intake.app.emit('open-url',{},'codex-personal://thread/xyz');assert.equal(live,'codex://thread/xyz');
+  intake.app.emit('open-url',{},'https://example.test');assert.equal(live,'https://example.test');
+  assert(!intake.calls.some(c=>c[0]==='restore'));
+  let second;intake.app.on('second-instance',(_,argv)=>{second=argv;});
+  intake.app.emit('second-instance',{},['app','codex-personal://thread/xyz']);assert.equal(second[1],'codex://thread/xyz');
+  const startup=boot({argv:['app','codex-personal://connector/oauth_callback?code=test']});
+  assert.equal(startup.proc.argv[1],'codex://connector/oauth_callback?code=test');
+  assert.equal(startup.timers.length,1);startup.timers[0]();assert(startup.calls.some(c=>c[0]==='restore'));
+  for(const extra of [{spawnFails:true},{env:{DOPPEL_URL_HANDLER_HELPER:undefined}}]) {
+    const safe=boot(extra);let got=false;safe.app.on('open-url',()=>{got=true;});
+    safe.app.emit('open-url',{},'codex://connector/oauth_callback');assert(got);
+  }
+  const throwing=boot();throwing.app.on('open-url',()=>{throw Error('vendor error');});
+  assert.throws(()=>throwing.app.emit('open-url',{},'codex://connector/oauth_callback'),/vendor error/);
+  assert(throwing.calls.some(c=>c[0]==='restore'));
+  for(const scheme of ['', 'codex','CODEX','codex-dev','bad scheme']) {
+    assert.throws(()=>boot({env:{DOPPEL_URL_SCHEME:scheme}}),/private URL scheme/);
+  }
+  console.log('Electron routing, OAuth ownership, event delivery, startup URLs, and failure handling passed.');
+})().catch(error=>{console.error(error);process.exitCode=1;});
+'''
+        result = subprocess.run([node, '-e', script], input=json.dumps(patcher.RUNTIME_SOURCE.decode()),
+                                text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == '__main__':
